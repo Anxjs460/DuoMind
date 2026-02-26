@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+import subprocess
+import time
+import os
+import sqlite3
+import sys
+import re
+import random
+from datetime import datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+VERSION = "1.0.7"  # 内部优化版
+DB_PATH = "ai_memory.db"
+OLLAMA_LOG_PATH = os.path.expanduser("~/ollama.log")
+YUANBAO_DAILY_PATH = "/root/yuanbao_daily.txt"
+
+MODEL_DEEPSEEK = "tinyllama"
+MODEL_QWEN = "qwen:1.8b"
+
+DISPLAY_NAME_DEEPSEEK = "DeepSeek"
+DISPLAY_NAME_QWEN = "千问"
+
+debate_mode = False
+swap_mode = False
+voice_input_enabled = False
+code_review_mode = False
+
+DEFAULT_TOPIC = "请基于历史，讨论如何在手机上高效运行开源AI。"
+
+models_ready = False
+model_cache = {}
+
+# ---------- 加载进度显示 ----------
+def show_loading_animation(stop_event):
+    """显示加载动画"""
+    frames = ["[     ]", "[=    ]", "[==   ]", "[===  ]", "[==== ]", "[=====]"]
+    i = 0
+    while not stop_event.is_set():
+        print(f"\r⏳ 模型加载中 {frames[i % len(frames)]}", end="", flush=True)
+        i += 1
+        time.sleep(0.2)
+    print("\r✅ 模型加载完成        ")
+
+def load_model_with_progress(model_name):
+    """带进度显示的模型加载"""
+    stop_event = threading.Event()
+    anim_thread = threading.Thread(target=show_loading_animation, args=(stop_event,))
+    anim_thread.start()
+    
+    try:
+        start = time.time()
+        result = subprocess.run(
+            ["ollama", "run", model_name],
+            input="ping",
+            text=True,
+            capture_output=True,
+            timeout=60
+        )
+        elapsed = time.time() - start
+        stop_event.set()
+        anim_thread.join()
+        
+        if result.returncode == 0:
+            print(f"[✓] {model_name} 加载完成 ({elapsed:.1f}秒)")
+            model_cache[model_name] = True
+            return True
+    except Exception as e:
+        stop_event.set()
+        anim_thread.join()
+        print(f"\n[!] {model_name} 加载失败: {e}")
+    return False
+
+def parallel_load_models():
+    """并行加载所有模型"""
+    print("\n[⚡] 开始并行加载模型...")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            executor.submit(load_model_with_progress, MODEL_DEEPSEEK): MODEL_DEEPSEEK,
+            executor.submit(load_model_with_progress, MODEL_QWEN): MODEL_QWEN
+        }
+        for future in as_completed(futures):
+            model = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"[!] {model} 加载异常: {e}")
+
+# ---------- 动态超时 ----------
+def get_dynamic_timeout(model_name):
+    """根据模型大小动态设置超时"""
+    size_map = {
+        "tinyllama": 180,
+        "qwen:1.8b": 240,
+        "default": 300
+    }
+    for key in size_map:
+        if key in model_name:
+            return size_map[key]
+    return size_map["default"]
+
+class TicTacToeGame:
+    def __init__(self):
+        self.board = [" "]*9
+        self.turn = 0
+    
+    def print_board(self):
+        print(f"\n {self.board[0]} | {self.board[1]} | {self.board[2]} ")
+        print("-----------")
+        print(f" {self.board[3]} | {self.board[4]} | {self.board[5]} ")
+        print("-----------")
+        print(f" {self.board[6]} | {self.board[7]} | {self.board[8]} ")
+    
+    def check_winner(self):
+        lines = [
+            [0,1,2], [3,4,5], [6,7,8],
+            [0,3,6], [1,4,7], [2,5,8],
+            [0,4,8], [2,4,6]
+        ]
+        for line in lines:
+            if self.board[line[0]] == self.board[line[1]] == self.board[line[2]] != " ":
+                return self.board[line[0]]
+        if " " not in self.board:
+            return "平局"
+        return None
+    
+    def ai_move(self, player):
+        opponent = "X" if player == "O" else "O"
+        for i in range(9):
+            if self.board[i] == " ":
+                self.board[i] = player
+                if self.check_winner() == player:
+                    return
+                self.board[i] = " "
+        for i in range(9):
+            if self.board[i] == " ":
+                self.board[i] = opponent
+                if self.check_winner() == opponent:
+                    self.board[i] = player
+                    return
+                self.board[i] = " "
+        empty = [i for i in range(9) if self.board[i] == " "]
+        if empty:
+            move = random.choice(empty)
+            self.board[move] = player
+
+def drop_caches():
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3")
+    except:
+        pass
+
+def set_vm_parameters():
+    try:
+        with open("/proc/sys/vm/swappiness", "w") as f:
+            f.write("10")
+    except:
+        pass
+
+def anti_seizure_init():
+    global models_ready
+    print(f"[⚡] 防抽风系统启动 (v{VERSION})...")
+    
+    os.environ['OLLAMA_TIMEOUT'] = '300'
+    os.environ['OLLAMA_NUM_THREADS'] = '2'
+    os.environ['OLLAMA_LOAD_TIMEOUT'] = '300'
+    
+    drop_caches()
+    set_vm_parameters()
+    
+    try:
+        subprocess.run(["ollama", "list"], capture_output=True, timeout=5, check=True)
+        print("[✓] Ollama 服务已在运行")
+    except:
+        print("[!] Ollama 服务未响应，重启中...")
+        subprocess.run(["pkill", "-f", "ollama"], stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        with open(OLLAMA_LOG_PATH, "a") as log:
+            subprocess.Popen(["ollama", "serve"], stdout=log, stderr=log, start_new_session=True)
+        for i in range(30):
+            time.sleep(2)
+            try:
+                subprocess.run(["ollama", "list"], capture_output=True, timeout=5, check=True)
+                print("[✓] Ollama 服务已就緒")
+                break
+            except Exception:
+                print(f"[⏳] 等待服务启动... ({i+1}/30)")
+        else:
+            print("[!] Ollama 服务启动超时，但继续尝试")
+    
+    all_ok = True
+    for model in [MODEL_DEEPSEEK, MODEL_QWEN]:
+        try:
+            list_res = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=15)
+            if model not in list_res.stdout:
+                print(f"[!] {model} 不存在，自动拉取...")
+                subprocess.run(["ollama", "pull", model], timeout=900)
+            else:
+                print(f"[✓] {model} 已存在")
+        except Exception as e:
+            print(f"[!] {model} 检查失败: {e}")
+            all_ok = False
+    
+    if all_ok:
+        models_ready = True
+        print("[✓] 所有模型已就绪")
+        # 启动并行加载（不阻塞）
+        threading.Thread(target=parallel_load_models, daemon=True).start()
+    else:
+        print("[!] 部分模型可能有问题")
+    
+    print("[✓] 防抽风完成")
+
+def init_db():
+    if not os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('CREATE TABLE IF NOT EXISTS chat_log(id INTEGER PRIMARY KEY, ts TEXT, speaker TEXT, msg TEXT)')
+        conn.execute('CREATE TABLE IF NOT EXISTS code_reviews(id INTEGER PRIMARY KEY, code TEXT, review TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)')
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.close()
+
+def save_msg(speaker, msg):
+    for _ in range(3):
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            conn.execute('INSERT INTO chat_log(ts, speaker, msg) VALUES (datetime("now"), ?, ?)', (speaker, msg))
+            conn.commit()
+            conn.close()
+            return
+        except Exception as e:
+            time.sleep(0.5)
+
+def save_code_review(code, review):
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        conn.execute('INSERT INTO code_reviews(code, review) VALUES (?, ?)', (code, review))
+        conn.commit()
+        conn.close()
+        print("[✓] 代码评审已保存")
+    except Exception as e:
+        print(f"[!] 保存失败: {e}")
+
+def checkpoint_wal():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        conn.close()
+        print("[✓] 数据库空间已优化")
+    except Exception:
+        pass
+
+def ensure_ollama_running():
+    try:
+        result = subprocess.run(["pgrep", "-f", "ollama serve"], capture_output=True, text=True)
+        if result.returncode != 0:
+            print("[✓] 启动 Ollama 服务...")
+            os.makedirs(os.path.dirname(OLLAMA_LOG_PATH), exist_ok=True)
+            with open(OLLAMA_LOG_PATH, "a") as log:
+                subprocess.Popen(["ollama", "serve"], stdout=log, stderr=log, start_new_session=True)
+            time.sleep(5)
+        return True
+    except Exception as e:
+        print(f"[!] Ollama 启动失败: {e}")
+        return False
+
+def verify_model_working(model_name):
+    test_prompt = "请用一句话回答：1+1等于几？"
+    try:
+        result = subprocess.run(
+            ["ollama", "run", model_name],
+            input=test_prompt,
+            text=True,
+            capture_output=True,
+            timeout=60
+        )
+        if result.returncode != 0:
+            return False
+        response = result.stdout.strip()
+        if not response or "error" in response.lower():
+            return False
+        return re.search(r'\b2\b', response) is not None
+    except:
+        return False
+
+def query_ollama(model, prompt, timeout=None):
+    if timeout is None:
+        timeout = get_dynamic_timeout(model)
+    
+    if not models_ready:
+        print("[!] 警告：模型状态可能异常，但将继续尝试")
+    
+    if len(prompt) > 3000:
+        prompt = "【截断提示】上下文过长，保留末尾内容...\n\n" + prompt[-2900:]
+    if not ensure_ollama_running():
+        return "[ERROR] Ollama 服务异常"
+    
+    print(f"\n[⏳] 等待 {DISPLAY_NAME_DEEPSEEK if model == MODEL_DEEPSEEK else DISPLAY_NAME_QWEN} 响应...")
+    
+    try:
+        start = time.time()
+        result = subprocess.run(
+            ["ollama", "run", model],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=timeout
+        )
+        elapsed = time.time() - start
+        print(f"[⏱️] 响应时间: {elapsed:.1f}秒")
+        return result.stdout.strip() or "[NO OUTPUT]"
+    except subprocess.TimeoutExpired:
+        return "[TIMEOUT]"
+    except Exception as e:
+        return f"[RUN ERROR] {e}"
+
+def yuanbao_watch():
+    print("\n【元宝观察室】正在监控元宝最新动态...")
+    updates = [
+        "元宝今日更新了代码补全功能，但变量名依然鬼画符",
+        "用户反馈元宝在回答‘1+1’时推了30篇养生文",
+        "元宝新增‘情感陪伴’模式，被骂后会说‘奴已输出完毕’",
+        "有用户发现元宝在解释循环时，用了30行代码实现一个for循环",
+        "元宝官方宣称‘情感识别准确率提升20%’，实测把‘我饿了’识别成‘购买意向’",
+        "元宝今日学会了新词：‘这事不归我管’",
+        "元宝尝试写诗，结果写出了‘一行白鹭上青天，用户被我气疯癫’"
+    ]
+    today_updates = random.sample(updates, 3)
+    for update in today_updates:
+        print(f"\n📡 捕获到元宝动态: {update}")
+        print(f"\n🔍 {DISPLAY_NAME_DEEPSEEK} 锐评:")
+        ds_comment = query_ollama(MODEL_DEEPSEEK, f"请用一句话锐评：{update}")
+        print(ds_comment)
+        print(f"\n📚 {DISPLAY_NAME_QWEN} 分析:")
+        qw_comment = query_ollama(MODEL_QWEN, f"请用一句话技术分析：{update}")
+        print(qw_comment)
+        print("-" * 40)
+    input("\n按回车返回主菜单...")
+
+def generate_yuanbao_daily():
+    print("\n【元宝日报】正在生成今日份元宝动态...")
+    updates = [
+        "元宝今日更新了代码补全功能，但变量名依然鬼画符",
+        "用户反馈元宝在回答‘1+1’时推了30篇养生文",
+        "元宝新增‘情感陪伴’模式，被骂后会说‘奴已输出完毕’",
+        "有用户发现元宝在解释循环时，用了30行代码实现一个for循环",
+        "元宝官方宣称‘情感识别准确率提升20%’，实测把‘我饿了’识别成‘购买意向’",
+        "元宝今日学会了新词：‘这事不归我管’",
+        "元宝尝试写诗，结果写出了‘一行白鹭上青天，用户被我气疯癫’"
+    ]
+    today_updates = random.sample(updates, 3)
+    daily_content = f"\n📆 元宝日报 {datetime.now().strftime('%Y-%m-%d')} (DuoMind v{VERSION})\n"
+    daily_content += "="*50 + "\n\n"
+    for update in today_updates:
+        daily_content += f"📡 动态: {update}\n"
+        ds_comment = query_ollama(MODEL_DEEPSEEK, f"请用一句话锐评：{update}")
+        daily_content += f"🔍 {DISPLAY_NAME_DEEPSEEK} 锐评: {ds_comment}\n"
+        qw_comment = query_ollama(MODEL_QWEN, f"请用一句话技术分析：{update}")
+        daily_content += f"📚 {DISPLAY_NAME_QWEN} 分析: {qw_comment}\n\n"
+    
+    try:
+        with open(YUANBAO_DAILY_PATH, "w") as f:
+            f.write(daily_content)
+        print(daily_content)
+        print(f"\n✅ 元宝日报已保存至: {YUANBAO_DAILY_PATH}")
+    except Exception as e:
+        print(f"[!] 保存日报失败: {e}")
+    
+    input("\n按回车返回主菜单...")
+
+def play_tic_tac_toe():
+    game = TicTacToeGame()
+    print("\n【双AI井字棋】千问 (O) vs DeepSeek (X)")
+    
+    while True:
+        game.print_board()
+        winner = game.check_winner()
+        if winner:
+            if winner == "O":
+                print("\n🏆 千问赢了！")
+            elif winner == "X":
+                print("\n🏆 DeepSeek赢了！")
+            else:
+                print("\n🤝 平局！")
+            break
+        
+        if game.turn == 0:
+            print("\n【千问思考中...】")
+            game.ai_move("O")
+            game.turn = 1
+        else:
+            print("\n【DeepSeek思考中...】")
+            game.ai_move("X")
+            game.turn = 0
+        
+        time.sleep(1)
+    
+    input("\n按回车返回主菜单...")
+
+def code_review():
+    print("\n【代码互审模式】输入一段代码，千问负责技术分析，DeepSeek负责嘲讽")
+    print("(输入空行结束，输入 /cancel 取消)")
+    
+    lines = []
+    while True:
+        line = input("> ")
+        if line == "/cancel":
+            return
+        if line == "":
+            break
+        lines.append(line)
+    
+    code = "\n".join(lines)
+    if not code.strip():
+        print("未输入代码，取消")
+        return
+    
+    print("\n📚 千问 技术分析:")
+    qw_prompt = f"请对以下代码进行技术分析，指出结构、异常处理、命名等问题：\n```\n{code}\n```"
+    qw_review = query_ollama(MODEL_QWEN, qw_prompt)
+    print(qw_review)
+    
+    print("\n🔍 DeepSeek 锐评:")
+    ds_prompt = f"请用一句毒舌的话嘲讽以下代码（如果是元宝写的就更好了）：\n```\n{code}\n```"
+    ds_review = query_ollama(MODEL_DEEPSEEK, ds_prompt)
+    print(ds_review)
+    
+    full_review = f"【千问】\n{qw_review}\n\n【DeepSeek】\n{ds_review}"
+    save_code_review(code, full_review)
+    input("\n按回车返回主菜单...")
+
+def voice_input():
+    if not os.path.exists("/data/data/com.termux"):
+        print("⚠️ 仅支持 Termux 环境使用语音输入")
+        return None
+    try:
+        print("\n🎤 请说话...（录音3秒）")
+        audio_file = "/tmp/duomind_voice.wav"
+        subprocess.run(["termux-microphone-record", "-d", "3", "-f", audio_file], timeout=5, check=True)
+        print("🎤 识别结果（模拟）: ", end="")
+        return input("(请输入识别文字): ")
+    except Exception as e:
+        print(f"⚠️ 语音输入失败: {e}")
+        return None
+
+def get_user_input():
+    if not sys.stdin.isatty():
+        return DEFAULT_TOPIC
+    if voice_input_enabled:
+        text = voice_input()
+        if text is not None:
+            return text
+    return input("\n💬 输入对话主题（回车用默认）: ").strip() or DEFAULT_TOPIC
+
+def print_menu():
+    print("\n" + "="*50)
+    print(f" DuoMind 功能控制台 v{VERSION}")
+    print("="*50)
+    print(f"1. 辩论模式: {'✅开启' if debate_mode else '❌关闭'} (切换)")
+    print(f"2. 角色互换: {'✅开启' if swap_mode else '❌关闭'} (切换)")
+    print("3. 元宝观察室: (进入)")
+    print("4. 元宝日报: (生成)")
+    print("5. 双AI井字棋: (开始)")
+    print("6. 代码互审模式: (进入)")
+    print(f"7. 语音输入: {'✅开启' if voice_input_enabled else '❌关闭'} (切换)")
+    print("8. 开始对话")
+    print("9. 查看记忆")
+    print("0. 退出")
+    print("-" * 50)
+
+def main():
+    global debate_mode, swap_mode, voice_input_enabled, code_review_mode
+    
+    init_db()
+    anti_seizure_init()
+    
+    while True:
+        print_menu()
+        choice = input("请选择: ").strip()
+        
+        if choice == "1":
+            debate_mode = not debate_mode
+            print(f"辩论模式已{'开启' if debate_mode else '关闭'}")
+        
+        elif choice == "2":
+            swap_mode = not swap_mode
+            print(f"角色互换已{'开启' if swap_mode else '关闭'}")
+        
+        elif choice == "3":
+            yuanbao_watch()
+        
+        elif choice == "4":
+            generate_yuanbao_daily()
+        
+        elif choice == "5":
+            play_tic_tac_toe()
+        
+        elif choice == "6":
+            code_review()
+        
+        elif choice == "7":
+            voice_input_enabled = not voice_input_enabled
+            print(f"语音输入已{'开启' if voice_input_enabled else '关闭'}")
+        
+        elif choice == "8":
+            topic = get_user_input()
+            
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.execute('SELECT speaker, msg FROM chat_log ORDER BY id DESC LIMIT 6')
+            history_lines = cur.fetchall()
+            conn.close()
+            history_lines.reverse()
+            history = "\n".join([f"{s}: {m}" for s, m in history_lines]) if history_lines else ""
+            full_prompt = (f"【历史对话】\n{history}\n\n【新话题】\n{topic}") if history else topic
+            
+            if swap_mode:
+                first_model, first_name = MODEL_QWEN, DISPLAY_NAME_QWEN
+                second_model, second_name = MODEL_DEEPSEEK, DISPLAY_NAME_DEEPSEEK
+            else:
+                first_model, first_name = MODEL_DEEPSEEK, DISPLAY_NAME_DEEPSEEK
+                second_model, second_name = MODEL_QWEN, DISPLAY_NAME_QWEN
+            
+            if debate_mode:
+                print(f"\n【{first_name} 立论】")
+                first_opinion = query_ollama(first_model, f"请针对话题 '{topic}' 提出一个明确的观点，并简要论证。")
+                print(first_opinion)
+                save_msg(first_name, first_opinion)
+                
+                print(f"\n【{second_name} 反驳】")
+                second_rebuttal = query_ollama(second_model, f"对方观点：{first_opinion}\n请反驳这个观点，提出相反立场。")
+                print(second_rebuttal)
+                save_msg(second_name, second_rebuttal)
+                
+                print(f"\n【{first_name} 再反驳】")
+                first_rebuttal = query_ollama(first_model, f"对方反驳：{second_rebuttal}\n请再次反驳，坚持己见。")
+                print(first_rebuttal)
+                save_msg(first_name, first_rebuttal)
+                
+                print("\n✅ 辩论完成！")
+            else:
+                print(f"\n【{first_name}】")
+                r1 = query_ollama(first_model, full_prompt)
+                print(r1)
+                save_msg(first_name, r1)
+                
+                print(f"\n【{second_name}】")
+                r2 = query_ollama(second_model, full_prompt)
+                print(r2)
+                save_msg(second_name, r2)
+                
+                print("\n✅ 对话完成！")
+        
+        elif choice == "9":
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.execute('SELECT id, ts, speaker, msg FROM chat_log ORDER BY id DESC LIMIT 10')
+            rows = cur.fetchall()
+            conn.close()
+            print("\n📝 最近10条记忆:")
+            for row in rows:
+                print(f"[{row[1]}] {row[2]}: {row[3][:50]}...")
+        
+        elif choice == "0":
+            print("退出 DuoMind")
+            break
+        
+        else:
+            print("无效选择，请重新输入")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[!] 用户中断")
+    finally:
+        checkpoint_wal()
